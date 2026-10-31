@@ -1,0 +1,13 @@
+// Example chrome-devtools MCP for claude, to place at the root of the target project
+{
+  // "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://${HOST_DOCKER_INTERNAL}:9222"],
+      "env": {
+        "NO_PROXY": "localhost,127.0.0.1,::1,${HOST_DOCKER_INTERNAL}",
+        "no_proxy": "localhost,127.0.0.1,::1,${HOST_DOCKER_INTERNAL}"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "update": "disable",
+  "model": "{env:OPENCODE_DEFAULT_MODEL}",
+  "username": "{env:USER_NAME}",
+  "permissions": [
+    { "action": "shell", "resource": "altrcode-ctl *", "effect": "allow" },
+    { "action": "websearch", "resource": "*", "effect": "allow" },
+    { "action": "shell", "resource": "opencode mcp add *", "effect": "ask" },
+    { "action": "shell", "resource": "npx *", "effect": "ask" },
+    { "action": "edit", "resource": ".claude/skills/*", "effect": "ask" }
+  ],
+  "websearch": { "provider": "random" }
+  // __PROVIDER_CONFIG__
+}
+

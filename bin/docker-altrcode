@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# docker-altrcode — runs a confined agent (opencode | claude) in an ephemeral
+# container + host dispatcher. One agent per session.
+set -euo pipefail
+
+# ---- paths ----
+ALTRCODE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/docker-altrcode"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/docker-altrcode"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/docker-altrcode"
+DISPATCHER="$ALTRCODE_ROOT/dispatcher/dispatcher.py"
+EGRESS="$ALTRCODE_ROOT/dispatcher/egress_proxy.py"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  docker-altrcode <project> [opencode|claude]  start an agent
+                                               project → name in ~/.config/docker-altrcode/<name>.conf
+                                               agent   → opencode (default) or claude
+EOF
+}
+
+# Reads the 'root' field of a config: the full project path.
+conf_root() {
+    awk -F= '/^[[:space:]]*root[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$1"
+}
+
+# Global domain whitelist toggle (egress proxy), read from .env.
+#   1 = blocking on (the container goes through the proxy, whitelist enforced)
+#   0 / missing = no blocking (direct traffic, default behavior)
+domain_whitelist_enabled() {
+    awk -F= '/^[[:space:]]*DOMAIN_WHITELIST[[:space:]]*=/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$ALTRCODE_ROOT/.env"
+}
+
+pin_protection_enabled() {
+    awk -F= '/^[[:space:]]*PIN_PROTECTION[[:space:]]*=/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$ALTRCODE_ROOT/.env"
+}
+
+get_claude_model() {
+    awk -F= '/^[[:space:]]*CLAUDE_DEFAULT_MODEL[[:space:]]*=/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$ALTRCODE_ROOT/.env"
+}
+
+get_user_language() {
+    awk -F= '/^[[:space:]]*USER_LANGUAGE[[:space:]]*=/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$ALTRCODE_ROOT/.env"
+}
+
+# Localized variant of a config file: <name>.<lang>.<ext> when USER_LANGUAGE is a
+# two-letter code and that file exists, otherwise the English default <name>.<ext>.
+localized_config() {
+    local file="$1" lang base ext
+    lang="$(get_user_language)"
+    base="${file%.*}" ext="${file##*.}"
+    if [[ "$lang" =~ ^[a-z]{2}$ && -f "$ALTRCODE_ROOT/config/$base.$lang.$ext" ]]; then
+        echo "$ALTRCODE_ROOT/config/$base.$lang.$ext"
+    else
+        echo "$ALTRCODE_ROOT/config/$file"
+    fi
+}
+
+get_global_domains() {
+    awk -F= '/^[[:space:]]*DOMAIN_GLOBAL_WHITELIST[[:space:]]*=/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$ALTRCODE_ROOT/.env"
+}
+
+get_host_docker_internal() {
+    awk -F= '/^[[:space:]]*HOST_DOCKER_INTERNAL[[:space:]]*=/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$ALTRCODE_ROOT/.env"
+}
+
+# True if <pid> is a live docker-altrcode launcher (not a pid reused by another program).
+is_launcher() {
+    local args
+    if [[ -r "/proc/$1/cmdline" ]]; then
+        args="$(tr '\0' ' ' < "/proc/$1/cmdline")"
+    else
+        args="$(ps -p "$1" -o args= 2>/dev/null || true)"
+    fi
+    [[ "$args" == *docker-altrcode* ]]
+}
+
+# ---- setup ----
+ensure_env() {
+    # API keys: .env (git-ignored) is created by copying .env.example.
+    [[ -f "$ALTRCODE_ROOT/.env" ]] || cp "$ALTRCODE_ROOT/.env.example" "$ALTRCODE_ROOT/.env"
+}
+
+prepare_dirs() {
+    local name="$1"
+    mkdir -p "$CONF_DIR" "$STATE_DIR" "$CACHE_DIR"
+    mkdir -p "$STATE_DIR/share/opencode" "$STATE_DIR/state/opencode" "$CACHE_DIR/opencode"
+    mkdir -p "$CONF_DIR/claude"
+    mkdir -p "$CONF_DIR/opencode"
+    # Configs copied from config/ on every up (source of truth is the repo).
+    python3 - "$ALTRCODE_ROOT/.env" \
+               "$ALTRCODE_ROOT/config/opencode-settings.jsonc" \
+               "$CONF_DIR/opencode/opencode.jsonc" <<'PYEOF'
+import sys, json
+
+env_file, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+
+env = {}
+with open(env_file) as f:
+    for line in f:
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, _, v = line.partition('=')
+            env[k.strip()] = v.strip()
+
+provider     = env.get('OPENCODE_PROVIDER', 'scaleway')
+provider_url = env.get('OPENCODE_PROVIDER_BASE_URL', '')
+provider_name = provider.capitalize()
+whitelist    = env.get('OPENCODE_MODELS_WHITELIST', '0') == '1'
+default_model = env.get('OPENCODE_DEFAULT_MODEL', '')
+models_raw   = env.get('OPENCODE_MODELS', '')
+
+models = []
+for entry in models_raw.split():
+    parts = entry.split(':')
+    if len(parts) == 3:
+        models.append((parts[0], int(parts[1]), int(parts[2])))
+    elif len(parts) == 1:
+        models.append((parts[0], None, None))
+
+full_default = ('scw/' if whitelist else provider + '/') + default_model
+
+with open(src) as f:
+    lines = f.readlines()
+
+result = []
+for line in lines:
+    if '{env:OPENCODE_DEFAULT_MODEL}' in line:
+        result.append(line.replace('{env:OPENCODE_DEFAULT_MODEL}', full_default))
+        continue
+    if '// __PROVIDER_CONFIG__' in line:
+        ind = line[:len(line) - len(line.lstrip())]
+        if whitelist:
+            result.append(ind + f',"disabled_providers": [{json.dumps(provider)}]\n')
+            result.append(ind + ',"provider": {\n')
+            result.append(ind + '  "scw": {\n')
+            result.append(ind + '    "npm": "@ai-sdk/openai-compatible",\n')
+            result.append(ind + f'    "name": {json.dumps(provider_name)},\n')
+            result.append(ind + '    "options": {\n')
+            result.append(ind + f'      "baseURL": {json.dumps(provider_url)},\n')
+            result.append(ind + '      "apiKey": "{env:OPENCODE_PROVIDER_API_KEY}"\n')
+            result.append(ind + '    },\n')
+            result.append(ind + '    "models": {\n')
+            for i, (mid, ctx, out_lim) in enumerate(models):
+                limit_obj = {}
+                if ctx:     limit_obj['context'] = ctx
+                if out_lim: limit_obj['output']  = out_lim
+                comma = '' if i == len(models) - 1 else ','
+                val = json.dumps({'limit': limit_obj}) if limit_obj else '{}'
+                result.append(ind + f'      {json.dumps(mid)}: {val}{comma}\n')
+            result.append(ind + '    }\n')
+            result.append(ind + '  }\n')
+            result.append(ind + '}\n')
+        else:
+            result.append(ind + ',"providers": {\n')
+            result.append(ind + f'  {json.dumps(provider)}: {{\n')
+            result.append(ind + f'    "name": {json.dumps(provider_name)},\n')
+            result.append(ind + '    "env": ["OPENCODE_PROVIDER_API_KEY"]\n')
+            result.append(ind + '  }\n')
+            result.append(ind + '}\n')
+    else:
+        result.append(line)
+
+with open(dst, 'w') as f:
+    f.writelines(result)
+PYEOF
+    cp -f "$(localized_config AGENTS.md)"                 "$CONF_DIR/opencode/AGENTS.md"
+    cp -f "$ALTRCODE_ROOT/config/CLAUDE.md"               "$CONF_DIR/claude/CLAUDE.md"
+    # claude-settings.json: envsubst substitutes ${CLAUDE_DEFAULT_MODEL} only.
+    CLAUDE_DEFAULT_MODEL="$(get_claude_model)" \
+        envsubst '$CLAUDE_DEFAULT_MODEL' \
+        < "$ALTRCODE_ROOT/config/claude-settings.json" \
+        > "$CONF_DIR/claude/settings.json"
+    rm -f "$CONF_DIR/opencode/instructions.md"
+    # opencode: background service disabled → one private server per client, which inherits
+    # its container's proxy. The shared service records its address (127.0.0.1, specific
+    # to each container) and its proxy in files shared by all instances.
+    printf '{\n  "disabled": true\n}\n' > "$CONF_DIR/opencode/service.json"
+    chmod 600 "$CONF_DIR/opencode/service.json"
+    rm -f "$STATE_DIR/state/opencode/service.json"
+}
+
+cmd_run() {
+    local arg="${1:-}" dir name conf dispatcher_log i pins_file wl port egress_log proxy
+    local SOURCE_CONF probe_code rc
+    local -a comp_env
+    # Globals (not local): the EXIT trap runs after cmd_run returns.
+    disp_pid=""
+    egress_pid=""
+    owner_file=""
+    sock=""
+    port_file=""
+    [[ -n "$arg" ]] || { echo "usage: docker-altrcode <project> [opencode|claude]" >&2; exit 1; }
+    agent="${2:-}"
+    if [[ -z "$agent" ]]; then
+        agent="$(awk -F= '/^[[:space:]]*DEFAULT_AGENT[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$ALTRCODE_ROOT/.env")"
+        agent="${agent:-opencode}"
+    fi
+    case "$agent" in
+        opencode|claude) ;;
+        *) echo "unknown agent: $agent (expected: opencode|claude)" >&2; exit 1 ;;
+    esac
+    extra=("${@:3}")
+    name="$arg"
+    conf="$CONF_DIR/$name.conf"
+    # Sync from dispatcher/projects/<name>.conf (source of truth).
+    # A project without a template (declared by hand) is left untouched.
+    SOURCE_CONF="$ALTRCODE_ROOT/dispatcher/projects/$name.conf"
+    if [[ -f "$SOURCE_CONF" ]]; then
+        mkdir -p "$CONF_DIR"
+        cp -f "$SOURCE_CONF" "$conf"
+        echo "project config synced: $conf"
+    fi
+    [[ -f "$conf" ]] || {
+        echo "missing config: $conf (copy it from dispatcher/projects/<name>.conf)" >&2
+        exit 1
+    }
+    dir="$(conf_root "$conf")"
+    [[ -n "$dir" ]] || { echo "'root' field missing in $conf" >&2; exit 1; }
+    dir="$(realpath "$dir")"
+
+    # One instance per project: a second one would break the first one's dispatcher,
+    # proxy and socket. Dead launcher (crash) → orphan, cleaned up by the pkill below.
+    mkdir -p "$CACHE_DIR/run/$name"
+    owner_file="$CACHE_DIR/run/$name/owner.pid"
+    owner_pid="$(cat "$owner_file" 2>/dev/null || true)"
+    if [[ "$owner_pid" =~ ^[0-9]+$ && "$owner_pid" != "$$" ]] && is_launcher "$owner_pid"; then
+        echo "an instance is already running for project '$name' (launcher pid $owner_pid)." >&2
+        echo "One instance per project: exit the running session before starting a new one." >&2
+        exit 1
+    fi
+    echo "$$" > "$owner_file"
+
+    ensure_env
+    prepare_dirs "$name"
+
+    # Kill orphan processes of this config before starting new ones.
+    pkill -f "$DISPATCHER --config $conf" 2>/dev/null || true
+    pkill -f "$EGRESS --config $conf" 2>/dev/null || true
+
+    mkdir -p "$CACHE_DIR/run/$name"
+    sock="$CACHE_DIR/run/$name/ctl.sock"
+    rm -f "$sock"
+
+    # Pins: hash the [pins] files before launch (PIN_PROTECTION=0 → empty).
+    pins_file="$CACHE_DIR/run/$name/pins.json"
+    if [[ "$(pin_protection_enabled)" == "1" ]]; then
+        python3 "$DISPATCHER" pins --config "$conf" --pins-file "$pins_file"
+    else
+        echo "{}" > "$pins_file"
+    fi
+
+    # Start the host dispatcher (background, stopped on exit).
+    dispatcher_log="$CACHE_DIR/run/$name/dispatcher.log"
+    python3 "$DISPATCHER" serve --config "$conf" \
+        --socket "$sock" --pins-file "$pins_file" \
+        >"$dispatcher_log" 2>&1 &
+    disp_pid=$!
+
+    # Egress proxy: active when DOMAIN_WHITELIST=1; actual port written to a file.
+    host_docker_internal="$(get_host_docker_internal)"
+    host_docker_internal="${host_docker_internal:-172.17.0.1}"
+
+    wl="$(domain_whitelist_enabled)"
+    egress_pid=""
+    port_file=""
+    if [[ "$wl" == "1" ]]; then
+        egress_log="$CACHE_DIR/run/$name/egress.log"
+        port_file="$CACHE_DIR/run/$name/egress.port"
+        rm -f "$port_file"
+        DOMAIN_GLOBAL_WHITELIST="$(get_global_domains)" \
+            python3 "$EGRESS" --config "$conf" \
+            --port-file "$port_file" >"$egress_log" 2>&1 &
+        egress_pid=$!
+        port=""
+        for i in $(seq 1 50); do
+            [[ -f "$port_file" ]] && { port="$(cat "$port_file")"; break; }
+            sleep 0.1
+        done
+        if [[ -z "$port" ]]; then
+            echo "egress proxy did not start: see $egress_log" >&2
+            kill -TERM "${disp_pid:-}" "${egress_pid:-}" 2>/dev/null || true
+            exit 1
+        fi
+        proxy="http://host.docker.internal:$port"
+    else
+        proxy=""
+    fi
+
+    trap 'kill -TERM "${disp_pid:-}" "${egress_pid:-}" 2>/dev/null || true; \
+          rm -f "${sock:-}" "${port_file:-}" "${owner_file:-}"' EXIT
+
+    # Wait for the socket to exist.
+    for i in $(seq 1 50); do
+        [[ -S "$sock" ]] && break
+        sleep 0.1
+    done
+    [[ -S "$sock" ]] || { echo "dispatcher did not start: see $dispatcher_log" >&2; exit 1; }
+
+    if [[ "$wl" == "1" ]]; then
+        echo "→ domain whitelist ACTIVE (egress proxy port $port; see $egress_log)"
+        # Self-test: plain HTTP probe (not CONNECT) to confirm the 403.
+        if command -v curl >/dev/null 2>&1; then
+            probe_code="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+                -x "http://127.0.0.1:$port" http://duckduckgo.com/ 2>/dev/null || echo '')"
+            if [[ "$probe_code" == "403" ]]; then
+                echo "→ proxy self-test: filter OK (duckduckgo.com → HTTP $probe_code)"
+            else
+                echo "→ ⚠️ proxy self-test: duckduckgo.com NOT blocked (HTTP ${probe_code:-?}) — filter inactive, see $egress_log" >&2
+            fi
+        fi
+        comp_env=(
+            --env "HTTP_PROXY=$proxy"
+            --env "HTTPS_PROXY=$proxy"
+            --env "ALL_PROXY=$proxy"
+            --env "http_proxy=$proxy"
+            --env "https_proxy=$proxy"
+            --env "all_proxy=$proxy"
+            --env "NO_PROXY=localhost,127.0.0.1,::1,${host_docker_internal}"
+            --env "no_proxy=localhost,127.0.0.1,::1,${host_docker_internal}"
+            --env "NODE_USE_ENV_PROXY=1"
+        )
+    else
+        echo "→ domain whitelist INACTIVE (DOMAIN_WHITELIST≠1; direct traffic)"
+        comp_env=()
+    fi
+    echo "→ agent container=$agent ($name) — Ctrl+D or 'exit' to quit"
+    export \
+        PROJECT_DIR="$dir" \
+        DOCKER_ALTRCODE_CONF="$CONF_DIR" \
+        DOCKER_ALTRCODE_STATE="$STATE_DIR" \
+        DOCKER_ALTRCODE_CACHE="$CACHE_DIR" \
+        DOCKER_ALTRCODE_CTL_SOCKET="$sock" \
+        DOCKER_ALTRCODE_PROXY="${proxy:-}" \
+        HOST_UID="$(id -u)" \
+        HOST_GID="$(id -g)"
+    export DOCKER_ALTRCODE_OPENCODE_CONF="$CONF_DIR/opencode"
+    export DOCKER_ALTRCODE_OPENCODE_SHARE="$STATE_DIR/share/opencode"
+    export DOCKER_ALTRCODE_OPENCODE_STATE="$STATE_DIR/state/opencode"
+    export DOCKER_ALTRCODE_OPENCODE_CACHE="$CACHE_DIR/opencode"
+    export DOCKER_ALTRCODE_CLAUDE_CONF="$CONF_DIR/claude"
+
+    # Pinned files: :ro overmounts in /work (on top of the project's :rw volume).
+    # Each file listed in [pins] is mounted read-only individually.
+    comp_vols=()
+    while IFS= read -r pin_path; do
+        for f in "$dir"/$pin_path; do
+            [[ -e "$f" ]] || continue
+            rel="${f#$dir/}"
+            comp_vols+=(-v "$f:/work/$rel:ro")
+        done
+    done < <(awk '/^\[pins\]/{p=1;next} /^\[/{p=0} p{
+        gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if (length > 0 && !/^[;#]/) print
+    }' "$conf")
+
+    # Extra directories: [extra_dirs] host_path = container_path.
+    while IFS='|' read -r host_path container_path; do
+        [[ -n "$host_path" && -n "$container_path" ]] || continue
+        comp_vols+=(-v "$host_path:$container_path:rw")
+    done < <(awk '/^\[extra_dirs\]/{p=1;next} /^\[/{p=0} p && /=/ && !/^[[:space:]]*[;#]/{
+        split($0, a, "=");
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[1]);
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[2]);
+        if (a[1] != "" && a[2] != "") print a[1] "|" a[2]
+    }' "$conf")
+
+    # Explicit name: `compose run` ignores container_name and forces <project>-<service>-run-<id>.
+    # Random suffix (12 hex chars, like compose): parallel instances remain possible.
+    run_name="docker-altrcode_agents-run-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+
+    rc=0
+    docker compose -f "$ALTRCODE_ROOT/docker-compose.yml" run "${comp_env[@]}" \
+        "${comp_vols[@]}" \
+        --name "$run_name" \
+        --env "DEFAULT_AGENT=$agent" \
+        --env "HOST_DOCKER_INTERNAL=${host_docker_internal}" \
+        --rm agents "${extra[@]}" \
+        || rc=$?
+    if [[ "$rc" != "0" ]]; then
+        echo "→ $agent session ended abnormally (code $rc)." >&2
+        echo "  If the terminal prints mouse codes (35;95;48M…) or stops responding:" >&2
+        echo "  type \"reset\" then Enter (or Ctrl+L)." >&2
+    fi
+    echo "→ dispatcher stopped."
+    return "$rc"
+}
+
+
+# ---- main dispatch ----
+case "${1:-}" in
+    help|-h|--help) usage ;;
+    run)   shift; cmd_run "$@" ;;
+    *)     cmd_run "$@" ;;
+esac

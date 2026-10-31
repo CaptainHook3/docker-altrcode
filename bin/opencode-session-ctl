@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""opencode-session-ctl — manage the opencode sessions of the docker-altrcode sandbox.
+
+Usage:
+    opencode-session-ctl list                # list sessions (most recent first)
+    opencode-session-ctl clean               # delete ALL sessions (asks for confirmation)
+    opencode-session-ctl clean --yes         # same, without confirmation (non-interactive)
+    opencode-session-ctl clean <session-id>  # delete a single session (with backup)
+
+Sessions live in opencode.db (tables session_v2 / session_message). Tables linked by
+cascade (session_part, schedule, blob_ref…) follow; job is cleaned explicitly.
+Path can be overridden with OPENCODE_DB. Automatic backup before any cleanup.
+"""
+import datetime
+import os
+import sqlite3
+import sys
+import time
+
+DB = os.environ.get(
+    "OPENCODE_DB",
+    os.path.expanduser(
+        "~/.local/state/docker-altrcode/share/opencode/opencode.db"
+    ),
+)
+
+
+def connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def has_v2(con: sqlite3.Connection) -> bool:
+    tabs = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return "session_v2" in tabs
+
+
+def fmt_ts(ms) -> str:
+    if not ms:
+        return "-"
+    try:
+        return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError):
+        return "-"
+
+
+def label(row) -> str:
+    t = row["title"] or row["slug"] or row["id"]
+    return str(t)[:80]
+
+
+def ask_confirm(prompt: str) -> bool:
+    """Asks y/N. Defaults to NO (and without a TTY, nothing is deleted)."""
+    try:
+        ans = input(prompt + " [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans in ("y", "yes", "o", "oui")
+
+
+def cmd_list(con: sqlite3.Connection) -> int:
+    if not has_v2(con):
+        print(f"no session database (session_v2 not found): {DB}")
+        return 1
+    rows = con.execute(
+        """
+        SELECT s.id, s.title, s.slug, s.model, s.parent_id,
+               s.time_created, s.time_updated,
+               (SELECT COUNT(*) FROM session_message m
+                 WHERE m.session_id = s.id) AS msgs
+        FROM session_v2 s
+        ORDER BY s.time_updated DESC
+        """
+    ).fetchall()
+    if not rows:
+        print("no recorded session (session_v2 is empty).")
+        return 0
+    header = f"{'ID':<40} {'MSG':>4}  {'Created':<16} {'Updated':<16}  Title"
+    print(header)
+    print("-" * 120)
+    kids = sum(1 for r in rows if r["parent_id"])
+    for r in rows:
+        star = " "  # agent sub-session
+        print(
+            f"{r['id']:<40} {r['msgs']:>4}  {fmt_ts(r['time_created']):<16} "
+            f"{fmt_ts(r['time_updated']):<16}  {label(r)}"
+        )
+    print("-" * 120)
+    print(f"total: {len(rows)} session(s) (including {kids} agent sub-session(s))")
+    return 0
+
+
+def backup(con: sqlite3.Connection) -> str:
+    """Consistent SQLite backup (safe even while opencode runs in WAL mode)."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dest = f"{DB}.backup-{ts}"
+    dst = sqlite3.connect(dest)
+    try:
+        con.backup(dst)
+    finally:
+        dst.close()
+    return dest
+
+
+def existing_tables(con: sqlite3.Connection) -> set:
+    return {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+
+
+def delete_session(con: sqlite3.Connection, sid: str) -> None:
+    tables = existing_tables(con)
+    for t in ("session_message", "session_pending", "session_inbox",
+              "instruction_entry", "instruction_state"):
+        if t in tables:
+            con.execute(f"DELETE FROM {t} WHERE session_id=?", (sid,))
+    # job (opencode ≥ 2.2.5): background jobs, no cascade to session_v2.
+    if "job" in tables:
+        con.execute("DELETE FROM job WHERE session_id=? OR child_session_id=?", (sid, sid))
+    con.execute("DELETE FROM session_v2 WHERE id=?", (sid,))
+    # Orphan sub-sessions (subagents) of this session.
+    kids = con.execute(
+        "SELECT id FROM session_v2 WHERE parent_id=?", (sid,)
+    ).fetchall()
+    for k in kids:
+        delete_session(con, k["id"])
+
+
+def cmd_clean(con: sqlite3.Connection, sid, force: bool = False) -> int:
+    if not has_v2(con):
+        print(f"no session database: {DB}")
+        return 1
+    if sid:
+        row = con.execute(
+            "SELECT id,title FROM session_v2 WHERE id=?", (sid,)
+        ).fetchone()
+        if not row:
+            print(f"session not found: {sid}")
+            return 1
+        msgs = con.execute(
+            "SELECT COUNT(*) FROM session_message WHERE session_id=?", (sid,)
+        ).fetchone()[0]
+        bkp = backup(con)
+        delete_session(con, sid)
+        con.commit()
+        print(f"session deleted: {sid} ({msgs} message(s))")
+    else:
+        n = con.execute("SELECT COUNT(*) FROM session_v2").fetchone()[0]
+        if not n:
+            print("no session to clean (session_v2 is empty).")
+            return 0
+        m = con.execute("SELECT COUNT(*) FROM session_message").fetchone()[0]
+        if not force:
+            if not ask_confirm(
+                f"Delete ALL {n} session(s) ({m} message(s)/fragments)?"
+            ):
+                print("cancelled — nothing was deleted.")
+                return 0
+        bkp = backup(con)
+        tables = existing_tables(con)
+        for t in ("session_message", "session_pending", "session_inbox",
+                  "instruction_entry", "instruction_state", "job", "session_v2"):
+            if t in tables:
+                con.execute(f"DELETE FROM {t}")
+        con.commit()
+        print(f"{n} session(s) deleted ({m} message(s))")
+    print(f"backup before cleanup: {bkp}")
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 2
+    cmd = args[0]
+    if cmd == "list":
+        con = connect()
+        try:
+            return cmd_list(con)
+        finally:
+            con.close()
+    if cmd == "clean":
+        if not os.path.exists(DB):
+            print(f"database not found: {DB}")
+            return 1
+        rest = [a for a in args[1:] if a not in ("-y", "--yes")]
+        force = len(rest) != len(args[1:])
+        sid = rest[0] if rest else None
+        con = connect()
+        try:
+            return cmd_clean(con, sid, force)
+        finally:
+            con.close()
+    print("usage: opencode-session-ctl {list | clean [session-id]}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

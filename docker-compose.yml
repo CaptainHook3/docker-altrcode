@@ -1,0 +1,52 @@
+services:
+  agents:
+    image: agents_docker-altrcode
+    build: .
+    container_name: docker-altrcode_agents
+    tty: true
+    stdin_open: true
+    init: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    user: "${HOST_UID}:${HOST_GID}"
+    working_dir: /work
+    environment:
+      HOST_UID: ${HOST_UID:-1000}
+      HOST_GID: ${HOST_GID:-1000}
+      HOME: /home/dev
+      TERM: ${TERM:-xterm-256color}
+      ALTRCODE_CTL_SOCKET: /run/altrcode-ctl/ctl.sock
+      DOCKER_ALTRCODE_PROXY: ${DOCKER_ALTRCODE_PROXY:-}
+      CLAUDE_CONFIG_DIR: /home/dev/.claude
+    env_file:
+      - .env
+    volumes:
+      - ${PROJECT_DIR}:/work:rw
+      - ${DOCKER_ALTRCODE_CTL_SOCKET}:/run/altrcode-ctl/ctl.sock
+      - ${DOCKER_ALTRCODE_OPENCODE_CONF}:/home/dev/.config/opencode:rw
+      - ${DOCKER_ALTRCODE_OPENCODE_CONF}/AGENTS.md:/home/dev/.config/opencode/AGENTS.md:ro
+      - ${DOCKER_ALTRCODE_OPENCODE_SHARE}:/home/dev/.local/share/opencode:rw
+      - ${DOCKER_ALTRCODE_OPENCODE_STATE}:/home/dev/.local/state/opencode:rw
+      - ${DOCKER_ALTRCODE_OPENCODE_CACHE}:/home/dev/.cache/opencode:rw
+      - ${DOCKER_ALTRCODE_CLAUDE_CONF}:/home/dev/.claude:rw
+      - ${DOCKER_ALTRCODE_CLAUDE_CONF}/CLAUDE.md:/home/dev/.claude/CLAUDE.md:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:exec
+      - /home/dev/.claude/sessions:uid=${HOST_UID:-1000},gid=${HOST_GID:-1000},mode=0700
+  chrome:
+    image: zenika/alpine-chrome:latest
+    container_name: docker-altrcode_chrome
+    command: >
+      --no-sandbox
+      --headless
+      --remote-debugging-address=0.0.0.0
+      --remote-debugging-port=9222
+      --disable-gpu
+      about:blank
+    network_mode: host
+    profiles:
+      - chrome

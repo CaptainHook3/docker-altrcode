@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""whisper-input — push-to-talk speech-to-text (faster-whisper).
+
+  whisper-input daemon   Starts the daemon (loads the model into memory).
+  whisper-input begin    Starts recording.
+  whisper-input end      Stops, transcribes and types the text.
+  whisper-input toggle   begin if idle, end otherwise (for GNOME).
+  whisper-input stop     Stops the daemon cleanly.
+
+Bind begin+end (or toggle) to a key in your WM/DE.
+Text is typed via xdotool (X11) or wtype (Wayland), detected automatically.
+"""
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+
+MODEL_SIZE  = os.environ.get("WHISPER_MODEL", "large-v3")
+LANGUAGE    = os.environ.get("WHISPER_LANG", "en")
+VENV_PYTHON = os.path.expanduser("~/.local/share/whisper-input/venv/bin/python3")
+CACHE_DIR   = os.path.expanduser("~/.cache/whisper-input")
+SOCK_PATH   = os.path.join(CACHE_DIR, "daemon.sock")
+
+if sys.executable != VENV_PYTHON and os.path.exists(VENV_PYTHON):
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
+
+def inject(text: str) -> None:
+    session = os.environ.get("XDG_SESSION_TYPE", "x11").lower()
+    if "wayland" in session:
+        subprocess.run(["wtype", text], check=False)
+    else:
+        subprocess.run(
+            ["xdotool", "type", "--clearmodifiers", "--delay", "0", text],
+            check=False,
+        )
+
+
+def send_cmd(cmd: str) -> None:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(SOCK_PATH)
+            s.sendall(cmd.encode())
+            response = s.recv(256).decode().strip()
+            if response:
+                print(response)
+    except (FileNotFoundError, ConnectionRefusedError):
+        sys.exit("Daemon not running. Start it first: whisper-input daemon &")
+
+
+def run_daemon() -> None:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as e:
+        sys.exit(
+            f"Missing dependency: {e}\n"
+            f"Run: {VENV_PYTHON} -m pip install faster-whisper"
+        )
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    if os.path.exists(SOCK_PATH):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(SOCK_PATH)
+                s.sendall(b"stop")
+                s.recv(256)
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass
+        os.remove(SOCK_PATH)
+
+    print(f"Loading whisper-{MODEL_SIZE}…", flush=True)
+    try:
+        model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+        print("GPU CUDA.", flush=True)
+    except Exception:
+        print("GPU unavailable, falling back to CPU int8.", flush=True)
+        model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+
+    print(f"Ready — socket {SOCK_PATH}", flush=True)
+
+    recording = False
+    audio_path: str | None = None
+    arecord_proc: subprocess.Popen | None = None
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+        srv.bind(SOCK_PATH)
+        srv.listen(1)
+
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                cmd = conn.recv(64).decode().strip()
+
+                if cmd == "stop":
+                    conn.sendall("Daemon stopped.".encode())
+                    return
+
+                elif cmd in ("begin", "toggle") and not recording:
+                    tmp = tempfile.NamedTemporaryFile(
+                        suffix=".wav", delete=False, dir=CACHE_DIR
+                    )
+                    tmp.close()
+                    audio_path = tmp.name
+                    arecord_proc = subprocess.Popen(
+                        ["arecord", "-q", "-r", "16000", "-c", "1",
+                         "-f", "S16_LE", "-d", "120", audio_path],
+                        stderr=subprocess.DEVNULL,
+                    )
+                    recording = True
+                    conn.sendall("⏺".encode())
+
+                elif cmd in ("end", "toggle") and recording:
+                    arecord_proc.send_signal(signal.SIGINT)
+                    arecord_proc.wait()
+                    recording = False
+                    captured = audio_path
+                    audio_path = None
+                    arecord_proc = None
+                    conn.sendall("⏹ transcription…".encode())
+                    conn.close()
+
+                    if os.path.getsize(captured) < 1024:
+                        os.unlink(captured)
+                        print("(empty recording)", flush=True)
+                        continue
+                    try:
+                        segments, _ = model.transcribe(
+                            captured, language=LANGUAGE, beam_size=5
+                        )
+                        text = " ".join(s.text for s in segments).strip()
+                    except Exception as e:
+                        print(f"Transcription error: {e}", flush=True)
+                        text = ""
+                    finally:
+                        os.unlink(captured)
+                    if text:
+                        print(f"→ {text}", flush=True)
+                        inject(text)
+                    else:
+                        print("(silence)", flush=True)
+
+                elif cmd == "begin" and recording:
+                    conn.sendall("Already recording.".encode())
+
+                elif cmd == "end" and not recording:
+                    conn.sendall("Not recording.".encode())
+
+                else:
+                    conn.sendall(f"Unknown command: {cmd}".encode())
+
+
+def main() -> None:
+    cmds = ("daemon", "begin", "end", "toggle", "stop")
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        sys.exit(f"Usage: whisper-input {' | '.join(cmds)}")
+    cmd = sys.argv[1]
+    if cmd == "daemon":
+        run_daemon()
+    else:
+        send_cmd(cmd)
+
+
+if __name__ == "__main__":
+    main()

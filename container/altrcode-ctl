@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""altrcode-ctl — docker-altrcode dispatcher client (runs INSIDE the container).
+
+Usage:
+    altrcode-ctl <op> [arg]
+
+The only execution channel to the host: the unix socket mounted at
+ALTRCODE_CTL_SOCKET (/run/altrcode-ctl/ctl.sock by default).
+"""
+import json
+import os
+import socket
+import sys
+
+SOCKET = os.environ.get("ALTRCODE_CTL_SOCKET", "/run/altrcode-ctl/ctl.sock")
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: altrcode-ctl <op> [arg]", file=sys.stderr)
+        return 2
+
+    op = sys.argv[1]
+    arg = sys.argv[2] if len(sys.argv) > 2 else None
+
+    req = {"op": op}
+    if arg is not None:
+        req["arg"] = arg
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1200)
+        sock.connect(SOCKET)
+    except OSError as exc:
+        print(f"altrcode-ctl: dispatcher unreachable ({exc}). "
+              f"Is the socket mounted? Is the dispatcher running?",
+              file=sys.stderr)
+        return 1
+
+    try:
+        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        buf = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                break
+    finally:
+        sock.close()
+
+    try:
+        resp = json.loads(buf.decode("utf-8").strip().split("\n")[0])
+    except (ValueError, IndexError):
+        print(buf.decode("utf-8", "replace"), end="")
+        return 1
+
+    out = resp.get("out", "")
+    if out:
+        print(out, end="")
+    if not resp.get("ok", False):
+        err = resp.get("error", "op refused")
+        print(f"\naltrcode-ctl: {err}", file=sys.stderr)
+    return int(resp.get("exit", 1))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
