@@ -381,6 +381,14 @@ whisper-stop
 
 Oui, si vous souhaitez utiliser le dispatcher. Chaque opération déclarée dans `[ops]` du conf projet correspond à une cible `make` du projet cible. Le dispatcher exécute `make <op>` dans le répertoire `root` du projet — sans Makefile, il n'y a rien à exécuter. Si votre projet n'a pas de Makefile (projet statique, repo de config…), laissez simplement `[ops]` vide ou absent : l'agent peut lire et écrire les fichiers librement, seule l'exécution de commandes de stack est impossible.
 
+**Pourquoi dois-je utiliser un Makefile plutôt que des commandes docker-compose ?**
+
+Pour la sécurité : accéder au démon Docker revient à être root sur l'hôte (`docker run -v /:/host --privileged …`). On ne peut pas filtrer de façon fiable des commandes docker arbitraires, mais on peut filtrer un nom de cible. Le Makefile, que vous écrivez et que le pinning protège, fixe les commandes réellement exécutées : fichier compose, nom du projet, répertoire de travail et volumes. L'agent ne peut que choisir une cible autorisée dans `[ops]`. Il ne peut pas ajouter `--project-directory`, `-f` ou `-v` pour élargir la portée sur l'hôte. Attention : sur une cible qui accepte un argument, `$(arg)` est ajouté tel quel à la recette. Le dispatcher bloque les métacaractères shell, mais pas les options (`--working-dir=/`, `--ssh`…). N'activez l'argument que là où c'est sans risque.
+
+**Pourquoi les agents ne peuvent-ils pas se mettre à jour tout seuls ?**
+
+Par sécurité : les agents sont installés en root dans l'image (`npm install -g`), mais le conteneur tourne sous un utilisateur non privilégié. Cet utilisateur n'a pas les droits d'écriture sur ses propres binaires, si bien qu'un agent ne peut ni modifier ni remplacer son code. L'auto-update est d'ailleurs désactivé dans les deux agents. Pour les mettre à jour, il suffit de rebuilder l'image : `make build` réinstalle toujours les dernières versions (voir **Mise à jour**).
+
 **Dois-je utiliser `make start` ou `make up` ?**
 
 C'est pareil : `start` est un alias de `up`, les deux cibles exécutent exactement la même commande.
