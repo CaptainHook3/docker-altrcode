@@ -381,6 +381,14 @@ whisper-stop
 
 Yes, if you want to use the dispatcher. Each operation declared in `[ops]` of the project config maps to a `make` target of the target project. The dispatcher runs `make <op>` in the project's `root` directory — without a Makefile, there is nothing to run. If your project has no Makefile (static project, config repository…), simply leave `[ops]` empty or omit it: the agent can freely read and write files, only running stack commands is impossible.
 
+**Why should I use a Makefile rather than docker-compose commands?**
+
+For security: access to the Docker daemon is equivalent to root on the host (`docker run -v /:/host --privileged …`). Arbitrary docker commands cannot be filtered reliably, but a target name can. The Makefile, which you write and pinning protects, fixes the commands that actually run: compose file, project name, working directory and volumes. The agent can only pick a target allowed in `[ops]`. It cannot add `--project-directory`, `-f` or `-v` to widen its reach on the host. Caution: on a target that accepts an argument, `$(arg)` is appended to the recipe as is. The dispatcher blocks shell metacharacters, but not options (`--working-dir=/`, `--ssh`…). Only enable the argument where it is harmless.
+
+**Why can't the agents update themselves?**
+
+For security: the agents are installed as root in the image (`npm install -g`), but the container runs as an unprivileged user. That user has no write access to its own binaries, so an agent can neither modify nor replace its code. Auto-update is also disabled in both agents. To update them, just rebuild the image: `make build` always reinstalls the latest versions (see **Updating**).
+
 **Should I use `make start` or `make up`?**
 
 They are the same: `start` is an alias of `up`, both targets run exactly the same command.
