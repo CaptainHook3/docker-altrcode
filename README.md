@@ -437,6 +437,7 @@ Yes, without restriction. docker-altrcode is released under the **MIT** license:
 
 - [Confused Deputy: The Old Bug That AI Agents Keep Reintroducing](https://auth0.com/blog/confused-deputy-the-old-bug-that-ai-agents-keep-reintroducing) — rationale for the dispatcher: running make without passing on the agent's secrets (Auth0, Sept. 2026)
 - [Policy Versus Physics: Docker Sandboxing for My AI SRE Agent](https://hackernoon.com/policy-versus-physics-docker-sandboxing-for-my-ai-sre-agent) — rationale for the egress proxy: why an OS-level network filter rather than a prompt rule (HackerNoon, July 2026)
+- [The Design and Implementation of Tripwire: A File System Integrity Checker](https://doi.org/10.1145/191177.191183) — rationale for pin checking: fingerprinting sensitive files and detecting any change (Kim & Spafford, ACM CCS, Nov. 1994)
 - [Choose a sandbox environment — Claude Code](https://code.claude.com/docs/en/sandbox-environments) — Docker/container/VM comparison for isolating Claude Code agents
 - [Memory — Claude Code](https://code.claude.com/docs/en/memory) — AGENTS.md, hierarchical context loading (CLAUDE.md, skills, index)
 - [HTTP CONNECT tunneling](https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/CONNECT) — how the HTTPS egress proxy works (TCP tunnel without MITM)
